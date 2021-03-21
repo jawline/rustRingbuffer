@@ -2,7 +2,7 @@ use std::{mem, alloc::{self, Layout}};
 use std::sync::{atomic::{AtomicUsize, AtomicBool, Ordering}, Arc};
 
 /**
- * A ring buffer is a queue data structure with a fixed capacity where items are written into a circular ring.
+ * A ring buffer is a queue data structure with a fixed capacity where items are written into a circular buffer.
  *
  * This ring buffer is implemented using direct memory allocations and pointers from the unsafe language subset.
  *
