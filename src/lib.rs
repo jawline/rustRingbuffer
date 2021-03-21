@@ -102,6 +102,11 @@ impl <T>Ringbuffer<T> {
 
       let write = self.next(write);
 
+      // TODO: Since we decide that we are full based on potentially stale data
+      // there is a change that read has already changed here. This cannot lead
+      // to corruption but could lead to write stalling.
+      // Should fix this later.
+
       if write == read {
         self.write.store(self.capacity, Ordering::Release);
       } else {
