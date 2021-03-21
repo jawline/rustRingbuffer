@@ -21,24 +21,11 @@ pub struct Ringbuffer<T> {
   capacity: usize,
 
   /// The index of the next item to be written
+  /// If the write buffer is full this will be set to capacity
   write: AtomicUsize,
 
   /// The index of the next item to be read
   read: AtomicUsize,
-
-  /**
-   * Since we are rolling the buffer back onto itself there are two meanings for head == tail
-   * 1) The buffer is exhausted, zero items
-   * 2) The buffer is full, capacity items
-   * The full flag differentiates between the two, it is set by write if write is creating a write == read scenario
-   *
-   * NOTE: This could be removed for some special indicator on write like write == capacity => stalled, but I
-   * leave it for clarity. We need to be careful with full since it can be written by either the producer or
-   * consumer, so we need to make sure that we only write to it from the consumer if it is set, and we only write
-   * to it from the consumer if it is not set. Since we know that the other side will not touch it until it is
-   * changed again it is then safe to share.
-   */
-  full: AtomicBool,
 }
 
 impl <T>Ringbuffer<T> {
@@ -57,7 +44,6 @@ impl <T>Ringbuffer<T> {
         capacity: capacity,
         write: AtomicUsize::new(0),
         read: AtomicUsize::new(0),
-        full: AtomicBool::new(false),
       }
     }
   }
@@ -75,13 +61,13 @@ impl <T>Ringbuffer<T> {
     self.data.offset(index as isize)
   }
 
-  fn current(&self) -> (usize, usize, bool) {
-    (self.read.load(Ordering::Acquire), self.write.load(Ordering::Acquire), self.full.load(Ordering::Acquire))
+  fn current(&self) -> (usize, usize) {
+    (self.read.load(Ordering::Acquire), self.write.load(Ordering::Acquire))
   }
 
   pub fn take(&mut self) -> Option<T> {
-    let (read, write, full) = self.current();
-    if read == write && !full {
+    let (read, write) = self.current();
+    if read == write {
       None
     } else {
 
@@ -91,20 +77,21 @@ impl <T>Ringbuffer<T> {
         rval = self.item(read).read();
       }
 
-      if read == write && full {
-        self.full.store(false, Ordering::Release);
-      }
-
       self.read.store(self.next(read), Ordering::Release);
+
+      // Now that the read head has moved, unlock write it if was stuck due to capacity
+      if write == self.capacity {
+        self.write.store(read, Ordering::Release);
+      }
 
       Some(rval)
     }
   }
 
   pub fn add(&mut self, v: T) -> Result<(), ()> {
-    let (read, write, full) = self.current();
+    let (read, write) = self.current();
 
-    if write == read && full {
+    if write == self.capacity {
       // No space available
       Err(())
     } else {
@@ -116,18 +103,18 @@ impl <T>Ringbuffer<T> {
       let write = self.next(write);
 
       if write == read {
-        self.full.store(true, Ordering::Release);
+        self.write.store(self.capacity, Ordering::Release);
+      } else {
+        self.write.store(write, Ordering::Release);
       }
-
-      self.write.store(write, Ordering::Release);
 
       Ok(())
     }
   }
 
   pub fn len(&self) -> usize {
-    let (read, write, full) = self.current();
-    if full {
+    let (read, write) = self.current();
+    if write == self.capacity {
       self.capacity
     } else if write < read {
       write + (self.capacity - read)
