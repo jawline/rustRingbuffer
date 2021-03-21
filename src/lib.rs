@@ -1,5 +1,5 @@
 use std::{mem, alloc::{self, Layout}};
-use std::sync::{atomic::{AtomicUsize, AtomicBool, Ordering}, Arc};
+use std::sync::{atomic::{AtomicUsize, Ordering}, Arc};
 
 /**
  * A ring buffer is a queue data structure with a fixed capacity where items are written into a circular buffer.
@@ -20,8 +20,10 @@ pub struct Ringbuffer<T> {
   /// The total capacity (measured in number of T, not bytes) of this ring buffer
   capacity: usize,
 
+  /// The mask (pow2 - 1) to index into the array (much faster than mod)
+  item_mask: usize,
+
   /// The index of the next item to be written
-  /// If the write buffer is full this will be set to capacity
   write: AtomicUsize,
 
   /// The index of the next item to be read
@@ -30,35 +32,47 @@ pub struct Ringbuffer<T> {
 
 impl <T>Ringbuffer<T> {
 
+  fn check_power_of_two(mut capacity: usize) -> bool {
+    let mut bits = 0;
+    while capacity != 0 && bits <= 1 {
+      if capacity & 0x1 == 0x1 {
+        bits += 1;
+      }
+      capacity = capacity >> 1;
+    }
+    bits == 1
+  }
+
   /// Create a fresh ringbuffer that can store up to capacity items in it's queue.
-  pub fn new(capacity: usize) -> Self {
+  /// The capacity must be a power of two.
+  pub fn new(capacity: usize) -> Result<Self, ()> {
+
+    // Check the capacity is a power of two
+    if !Ringbuffer::<T>::check_power_of_two(capacity) {
+      return Err(());
+    }
 
     // Unsafe rust malloc is a little nasty, we need to create a layout and then dealloc with the same alloc (any other layout to dealloc is UB)
     let memory_layout = Layout::from_size_align(capacity * mem::size_of::<T>(), mem::align_of::<T>()).expect("cannot created ring buffer memory layout");
 
     // Allocate memory for the RB, store the layout and initialize the read / write heads.
-    unsafe {
-      Self {
-        data: alloc::alloc(memory_layout) as *mut T,
-        data_layout: memory_layout,
-        capacity: capacity,
-        write: AtomicUsize::new(0),
-        read: AtomicUsize::new(0),
-      }
-    }
+    Ok(Self {
+      data: unsafe { alloc::alloc(memory_layout) as *mut T },
+      data_layout: memory_layout,
+      capacity: capacity,
+      item_mask: capacity - 1, /* this works only because capacity is a power of two so 100 becomes 011 (any bit will be a valid index) */
+      write: AtomicUsize::new(0),
+      read: AtomicUsize::new(0),
+    })
   }
 
-  pub fn threadsafe(capacity: usize) -> (Producer<T>, Consumer<T>) {
-    let new_rb = Arc::new(Ringbuffer::new(capacity));
-    (Producer { rb: new_rb.clone() }, Consumer { rb: new_rb.clone() })
-  }
-
-  fn next(&self, index: usize) -> usize {
-    (index + 1) % self.capacity
+  pub fn threadsafe(capacity: usize) -> Result<(Producer<T>, Consumer<T>), ()> {
+    let new_rb = Arc::new(Ringbuffer::new(capacity)?);
+    Ok((Producer { rb: new_rb.clone() }, Consumer { rb: new_rb.clone() }))
   }
 
   unsafe fn item(&self, index: usize) -> *mut T {
-    self.data.offset(index as isize)
+    self.data.offset((index & self.item_mask) as isize)
   }
 
   fn current(&self) -> (usize, usize) {
@@ -67,6 +81,7 @@ impl <T>Ringbuffer<T> {
 
   pub fn take(&mut self) -> Option<T> {
     let (read, write) = self.current();
+
     if read == write {
       None
     } else {
@@ -77,12 +92,7 @@ impl <T>Ringbuffer<T> {
         rval = self.item(read).read();
       }
 
-      self.read.store(self.next(read), Ordering::Release);
-
-      // Now that the read head has moved, unlock write it if was stuck due to capacity
-      if write == self.capacity {
-        self.write.store(read, Ordering::Release);
-      }
+      self.read.store(read + 1, Ordering::Release);
 
       Some(rval)
     }
@@ -91,7 +101,7 @@ impl <T>Ringbuffer<T> {
   pub fn add(&mut self, v: T) -> Result<(), ()> {
     let (read, write) = self.current();
 
-    if write == self.capacity {
+    if write == read + self.capacity {
       // No space available
       Err(())
     } else {
@@ -100,18 +110,7 @@ impl <T>Ringbuffer<T> {
         self.item(write).write(v);
       }
 
-      let write = self.next(write);
-
-      // TODO: Since we decide that we are full based on potentially stale data
-      // there is a change that read has already changed here. This cannot lead
-      // to corruption but could lead to write stalling.
-      // Should fix this later.
-
-      if write == read {
-        self.write.store(self.capacity, Ordering::Release);
-      } else {
-        self.write.store(write, Ordering::Release);
-      }
+      self.write.store(write + 1, Ordering::Release);
 
       Ok(())
     }
@@ -119,13 +118,7 @@ impl <T>Ringbuffer<T> {
 
   pub fn len(&self) -> usize {
     let (read, write) = self.current();
-    if write == self.capacity {
-      self.capacity
-    } else if write < read {
-      write + (self.capacity - read)
-    } else {
-      write - read
-    }
+    write - read
   }
 }
 
@@ -171,7 +164,7 @@ mod tests {
 
   #[test]
   fn basic_ring() {
-    let mut ring = Ringbuffer::new(50);
+    let mut ring = Ringbuffer::new(64).unwrap();
     ring.add(5).unwrap();
     ring.add(6).unwrap();
     ring.add(7).unwrap();
@@ -187,25 +180,38 @@ mod tests {
 
   #[test]
   fn empty_ring() {
-    let mut ring = Ringbuffer::<u32>::new(50);
+    let mut ring = Ringbuffer::<u32>::new(64).unwrap();
     assert_eq!(ring.len(), 0);
     assert_eq!(ring.take(), None);
   }
 
   #[test]
+  fn non_power_of_two() {
+    Ringbuffer::<u32>::new(8).unwrap();
+    Ringbuffer::<u32>::new(16).unwrap();
+    Ringbuffer::<u32>::new(65536).unwrap();
+    assert!(Ringbuffer::<u32>::new(17).is_err());
+    assert!(Ringbuffer::<u32>::new(19).is_err());
+    assert!(Ringbuffer::<u32>::new(5213).is_err());
+    assert!(Ringbuffer::<u32>::new(7).is_err());
+  }
+
+  #[test]
   fn filled_ring_stops() {
-    let mut ring = Ringbuffer::new(3);
+    let mut ring = Ringbuffer::new(4).unwrap();
     ring.add(5).unwrap();
     ring.add(6).unwrap();
     ring.add(7).unwrap();
+    ring.add(8).unwrap();
     assert!(ring.add(8).is_err());
     assert!(ring.add(9).is_err());
 
-    assert_eq!(ring.len(), 3);
+    assert_eq!(ring.len(), 4);
 
     assert_eq!(ring.take().unwrap(), 5);
     assert_eq!(ring.take().unwrap(), 6);
     assert_eq!(ring.take().unwrap(), 7);
+    assert_eq!(ring.take().unwrap(), 8);
 
     assert_eq!(ring.len(), 0);
 
@@ -214,7 +220,7 @@ mod tests {
 
   #[test]
   fn roll_over_test() {
-    let mut ring = Ringbuffer::new(100);
+    let mut ring = Ringbuffer::new(128).unwrap();
 
     for _ in 0..10000 {
       for i in 0..100 {
@@ -230,7 +236,7 @@ mod tests {
 
   #[test]
   fn threasafe_test() {
-    let (tx, rx) = Ringbuffer::threadsafe(100);
+    let (tx, rx) = Ringbuffer::threadsafe(128).unwrap();
 
     for _ in 0..10000 {
       for i in 0..100 {
