@@ -3,6 +3,9 @@ use std::sync::{atomic::{AtomicUsize, Ordering}, Arc};
 
 /**
  * A ring buffer is a queue data structure with a fixed capacity where items are written into a circular buffer.
+ * 
+ * The capacity of the ring buffer must be a power of two to allow the speed up provided by using & (capacity - 1)
+ * instead of % capacity. This works because when capacity is a power of two because capacity - 1 will return a bitmask that includes every possible value up to capacity and no values above it.
  *
  * This ring buffer is implemented using direct memory allocations and pointers from the unsafe language subset.
  *
