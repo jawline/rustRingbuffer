@@ -91,7 +91,7 @@ impl <T>Ringbuffer<T> {
         rval = self.item(read).read();
       }
 
-      if full {
+      if read == write && full {
         self.full.store(false, Ordering::Release);
       }
 
