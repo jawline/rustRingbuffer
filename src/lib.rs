@@ -85,8 +85,8 @@ impl <T>Ringbuffer<T> {
         rval = self.item(read).read();
       }
 
-      self.read.store(self.next(read), Ordering::Release);
       self.full.store(false, Ordering::Release);
+      self.read.store(self.next(read), Ordering::Release);
 
       Some(rval)
     }
@@ -105,11 +105,12 @@ impl <T>Ringbuffer<T> {
       }
 
       let write = self.next(write);
-      self.write.store(write, Ordering::Release);
 
       if write == read {
         self.full.store(true, Ordering::Release);
       }
+
+      self.write.store(write, Ordering::Release);
 
       Ok(())
     }
