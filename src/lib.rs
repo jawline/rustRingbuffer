@@ -31,6 +31,12 @@ pub struct Ringbuffer<T> {
    * 1) The buffer is exhausted, zero items
    * 2) The buffer is full, capacity items
    * The full flag differentiates between the two, it is set by write if write is creating a write == read scenario
+   *
+   * NOTE: This could be removed for some special indicator on write like write == capacity => stalled, but I
+   * leave it for clarity. We need to be careful with full since it can be written by either the producer or
+   * consumer, so we need to make sure that we only write to it from the consumer if it is set, and we only write
+   * to it from the consumer if it is not set. Since we know that the other side will not touch it until it is
+   * changed again it is then safe to share.
    */
   full: AtomicBool,
 }
@@ -85,7 +91,10 @@ impl <T>Ringbuffer<T> {
         rval = self.item(read).read();
       }
 
-      self.full.store(false, Ordering::Release);
+      if full {
+        self.full.store(false, Ordering::Release);
+      }
+
       self.read.store(self.next(read), Ordering::Release);
 
       Some(rval)
